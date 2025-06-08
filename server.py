@@ -7,6 +7,7 @@ from ag_ui.core import (
   EventType,
   RunStartedEvent,
   RunFinishedEvent,
+  CustomEvent,
   TextMessageStartEvent,
   TextMessageContentEvent,
   TextMessageEndEvent,
@@ -123,11 +124,21 @@ def print_event(event):
 
 @app.post("/awp")
 async def my_endpoint(input_data: RunAgentInput):
+    print(input_data.state)
+    agent_name = input_data.state.get('agent')
+    print(agent_name)
 
     async def event_generator():
         # Create an event encoder to properly format SSE events
         encoder = EventEncoder()
-
+        if agent_name:
+            yield encoder.encode(
+                CustomEvent(
+                    type=EventType.CUSTOM,
+                    name="agent_name",
+                    value=agent_name
+                )
+            )
         # Send run started event
         yield encoder.encode(
           RunStartedEvent(
