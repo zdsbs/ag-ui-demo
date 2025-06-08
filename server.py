@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from ag_ui.core import (
   RunAgentInput,
   Message,
@@ -24,6 +25,14 @@ from pprint import pformat
 OPENAI_MODEL = "gpt-4.1"
 
 app = FastAPI(title="AG-UI Endpoint")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Or ["http://localhost:3000"] for more security
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Load environment variables from .env file
 load_dotenv()
 
