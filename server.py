@@ -16,18 +16,95 @@ from ag_ui.core import (
 from ag_ui.encoder import EventEncoder
 import uuid
 from openai import OpenAI
-
 from dotenv import load_dotenv
+import json
+from pprint import pformat
 
 # OpenAI model to use
-OPENAI_MODEL = "gpt-4"
+OPENAI_MODEL = "gpt-4.1"
 
 app = FastAPI(title="AG-UI Endpoint")
 # Load environment variables from .env file
 load_dotenv()
 
+import requests
+
+def get_weather(latitude, longitude):
+    response = requests.get(f"https://api.open-meteo.com/v1/forecast?latitude={latitude}&longitude={longitude}&current=temperature_2m,wind_speed_10m&hourly=temperature_2m,relative_humidity_2m,wind_speed_10m")
+    data = response.json()
+    return data['current']['temperature_2m']
+
+tools = [{
+    "type": "function",
+    "name": "get_weather",
+    "description": "Get current temperature for provided coordinates in celsius.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "latitude": {"type": "number"},
+            "longitude": {"type": "number"}
+        },
+        "required": ["latitude", "longitude"],
+        "additionalProperties": False
+    },
+    "strict": True
+}]
+
+def print_event(event):
+    """Pretty print an event with its type and relevant data."""
+    print("\n" + "="*80)
+    print(f"Event Type: {event.type}")
+    print("-"*80)
+    
+    if hasattr(event, "item"):
+        print("Item:")
+        item = event.item
+        print(f"  Name: {item.name}")
+        print(f"  Status: {item.status}")
+        if hasattr(item, "arguments"):
+            try:
+                args = json.loads(item.arguments)
+                print("  Arguments:")
+                print(f"    {pformat(args, indent=4)}")
+            except:
+                print(f"  Arguments: {item.arguments}")
+    
+    if hasattr(event, "delta"):
+        print("Delta:")
+        print(f"  {event.delta}")
+    
+    if hasattr(event, "arguments"):
+        try:
+            args = json.loads(event.arguments)
+            print("Arguments:")
+            print(f"  {pformat(args, indent=2)}")
+        except:
+            print(f"Arguments: {event.arguments}")
+    
+    if hasattr(event, "response"):
+        resp = event.response
+        print("Response:")
+        if hasattr(resp, "text"):
+            print(f"  Text: {resp.text}")
+        if hasattr(resp, "tools"):
+            print("  Tools:")
+            for tool in resp.tools:
+                print(f"    - {tool.name}: {tool.description}")
+        if hasattr(resp, "output"):
+            print("  Output:")
+            for item in resp.output:
+                if hasattr(item, "arguments"):
+                    try:
+                        args = json.loads(item.arguments)
+                        print(f"    {item.name}: {pformat(args, indent=4)}")
+                    except:
+                        print(f"    {item.name}: {item.arguments}")
+    
+    print("="*80 + "\n")
+
 @app.post("/awp")
 async def my_endpoint(input_data: RunAgentInput):
+
     async def event_generator():
         # Create an event encoder to properly format SSE events
         encoder = EventEncoder()
@@ -44,181 +121,132 @@ async def my_endpoint(input_data: RunAgentInput):
         # Initialize OpenAI client
         client = OpenAI()
 
-        # Convert input messages to OpenAI format
-        openai_messages = [
-            {"role": msg.role, "content": msg.content}
-            for msg in input_data.messages
-        ]
-
-        # Convert tools to OpenAI format
-        openai_tools = []
-        for tool in input_data.tools:
-            openai_tools.append({
-                "type": "function",
-                "function": {
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": tool.parameters
-                }
-            })
-        print(openai_tools)
         # Generate a message ID for the assistant's response
-        message_id = uuid.uuid4()
+        message_id = str(uuid.uuid4())
 
         # Send text message start event
         yield encoder.encode(
             TextMessageStartEvent(
                 type=EventType.TEXT_MESSAGE_START,
-                message_id=str(message_id),
+                message_id=message_id,
                 role="assistant"
             )
         )
-
         # Create a streaming completion request
-        stream = client.chat.completions.create(
+        input_messages = [{"role": "user", "content": input_data.messages[0].content}]
+
+        stream = client.responses.create(
             model=OPENAI_MODEL,
-            messages=openai_messages,
-            tools=[],
+            input=input_messages,
+            tools=tools,
             stream=True
         )
 
-        # Track the current tool call
-        current_tool_call = None
-        current_args = ""
-        tool_call_results = []
-        assistant_message = None
+        tool_call = {}
 
-        # Process the streaming response and send content events
-        for chunk in stream:
-            if chunk.choices and chunk.choices[0].delta:
-                delta = chunk.choices[0].delta
-                if hasattr(delta, "content") and delta.content:
-                    content = delta.content
+        for event in stream:
+            #if the event is a function call, add it to the tool_call dictionary
+            initial_response = ""
+            if event.type == 'response.created':
+                print("created")
+                yield encoder.encode(
+                    TextMessageStartEvent(
+                        type=EventType.TEXT_MESSAGE_START,
+                        message_id=message_id,
+                        role="assistant"
+                    )
+                )
+            if event.type == 'response.output_text.delta':
+                print(event.delta, end='', flush=True)
+                initial_response += event.delta
+                yield encoder.encode(
+                    TextMessageContentEvent(
+                        type=EventType.TEXT_MESSAGE_CONTENT,
+                        message_id=message_id,
+                        delta=event.delta
+                    )
+                )
+            if event.type == 'response.completed':
+                print()
+                yield encoder.encode(
+                    TextMessageEndEvent(
+                        type=EventType.TEXT_MESSAGE_END,
+                        message_id=message_id
+                    )
+                )
+            if event.type == 'response.output_item.added' and event.item.type == "function_call":
+                tool_call[event.output_index] = event.item;
+            elif event.type == 'response.function_call_arguments.delta':
+                index = event.output_index
+                if tool_call[index]:
+                    tool_call[index].arguments += event.delta
+                    #encode the event
                     yield encoder.encode(
-                        TextMessageContentEvent(
-                            type=EventType.TEXT_MESSAGE_CONTENT,
-                            message_id=str(message_id),
-                            delta=content
+                        ToolCallArgsEvent(
+                            type=EventType.TOOL_CALL_ARGS,
+                            tool_call_id=event.item_id,
+                            delta=event.delta
                         )
                     )
-                elif hasattr(delta, "tool_calls") and delta.tool_calls is not None:
-                    for tool_call in delta.tool_calls:
-                        if tool_call.id and tool_call.function.name:
-                            # This is the start of a new tool call
-                            if current_tool_call is not None:
-                                # Send the previous tool call events
-                                yield encoder.encode(
-                                    ToolCallStartEvent(
-                                        type=EventType.TOOL_CALL_START,
-                                        tool_call_id=str(current_tool_call.id),
-                                        tool_call_name=current_tool_call.function.name,
-                                        parent_message_id=str(message_id)
-                                    )
-                                )
-                                yield encoder.encode(
-                                    ToolCallArgsEvent(
-                                        type=EventType.TOOL_CALL_ARGS,
-                                        tool_call_id=str(current_tool_call.id),
-                                        delta=current_args
-                                    )
-                                )
-                                yield encoder.encode(
-                                    ToolCallEndEvent(
-                                        type=EventType.TOOL_CALL_END,
-                                        tool_call_id=str(current_tool_call.id)
-                                    )
-                                )
-                                # Add the tool call result to the list
-                                tool_call_results.append({
-                                    "role": "tool",
-                                    "tool_call_id": str(current_tool_call.id),
-                                    "name": current_tool_call.function.name,
-                                    "content": "Tool call completed"  # Replace with actual tool result
-                                })
-                            # Start tracking the new tool call
-                            current_tool_call = tool_call
-                            current_args = tool_call.function.arguments
-                        elif current_tool_call is not None and tool_call.function.arguments:
-                            # This is a continuation of the current tool call
-                            current_args += tool_call.function.arguments
-
-        # Send any remaining tool call events
-        if current_tool_call is not None:
+        
+        if tool_call:
+            tool_call_obj = next(iter(tool_call.values()))
+            input_messages.append(tool_call_obj)  # append model's function call message
             yield encoder.encode(
                 ToolCallStartEvent(
                     type=EventType.TOOL_CALL_START,
-                    tool_call_id=str(current_tool_call.id),
-                    tool_call_name=current_tool_call.function.name,
-                    parent_message_id=str(message_id)
+                    tool_call_id=tool_call_obj.id,
+                    tool_call_name=tool_call_obj.name,
+                    parent_message_id=message_id
                 )
-            )
-            yield encoder.encode(
-                ToolCallArgsEvent(
-                    type=EventType.TOOL_CALL_ARGS,
-                    tool_call_id=str(current_tool_call.id),
-                    delta=current_args
-                )
-            )
-            yield encoder.encode(
-                ToolCallEndEvent(
-                    type=EventType.TOOL_CALL_END,
-                    tool_call_id=str(current_tool_call.id)
-                )
-            )
-            # Add the final tool call result
-            tool_call_results.append({
-                "role": "tool",
-                "tool_call_id": str(current_tool_call.id),
-                "name": current_tool_call.function.name,
-                "content": "Tool call completed"  # Replace with actual tool result
-            })
+            )         
+            #TODO dynamically call the tool
+            args = json.loads(tool_call_obj.arguments)
 
-        # If we have tool call results, make another request to get the final response
-        if tool_call_results:
-            # Add the assistant's message with tool calls
-            openai_messages.append({
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [{
-                    "id": str(current_tool_call.id),
-                    "type": "function",
-                    "function": {
-                        "name": current_tool_call.function.name,
-                        "arguments": current_args
-                    }
-                }]
+            result = get_weather(args["latitude"], args["longitude"])
+
+            input_messages.append({                               # append result message
+                "type": "function_call_output",
+                "call_id": tool_call_obj.call_id,
+                "output": str(result)
             })
-            print(openai_messages)
-            # Add tool call results to messages
-            openai_messages.extend(tool_call_results)
-            
-            # Make another request to get the final response
-            final_stream = client.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=openai_messages,
+            final_stream = client.responses.create(
+                model="gpt-4.1",
+                input=input_messages,
+                tools=tools,
                 stream=True
             )
+            # Initialize an empty string to build up the response
+            complete_response = ""
 
-            # Process the final response
-            for chunk in final_stream:
-                if chunk.choices and chunk.choices[0].delta:
-                    delta = chunk.choices[0].delta
-                    if hasattr(delta, "content") and delta.content:
-                        print(delta.content)
-                        content = delta.content
-                        yield encoder.encode(
-                            TextMessageContentEvent(
-                                type=EventType.TEXT_MESSAGE_CONTENT,
-                                message_id=str(message_id),
-                                delta=content
-                            )
+            for event in final_stream:
+                if event.type == 'response.output_text.delta':
+                    # Print each delta as it comes in
+                    print(event.delta, end='', flush=True)
+                    complete_response += event.delta
+                    yield encoder.encode(
+                        TextMessageContentEvent(
+                            type=EventType.TEXT_MESSAGE_CONTENT,
+                            message_id=message_id,
+                            delta=event.delta
                         )
+                    )
+                elif event.type == 'response.completed':
+                    # Print a newline at the end
+                    yield encoder.encode(
+                        TextMessageEndEvent(
+                            type=EventType.TEXT_MESSAGE_END,
+                            message_id=message_id
+                        )
+                    )
+                    print()
+
 
         # Send text message end event
         yield encoder.encode(
             TextMessageEndEvent(
                 type=EventType.TEXT_MESSAGE_END,
-                message_id=str(message_id)
+                message_id=message_id
             )
         )
 
@@ -233,7 +261,12 @@ async def my_endpoint(input_data: RunAgentInput):
 
     return StreamingResponse(
         event_generator(),
-        media_type="text/event-stream"
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
     )
 
 if __name__ == "__main__":
