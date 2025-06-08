@@ -1,0 +1,17 @@
+curl -X POST http://localhost:8000/awp \
+  -H "Content-Type: application/json" \
+  -d '{
+    "thread_id": "test-thread-123",
+    "run_id": "test-run-456",
+    "state": {},
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello, how are you?",
+        "id": "user-789"
+      }
+    ],
+    "tools": [],
+    "context": [],
+    "forwardedProps": {}
+  }'
