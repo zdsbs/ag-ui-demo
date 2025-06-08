@@ -39,9 +39,19 @@ load_dotenv()
 import requests
 
 def get_weather(latitude, longitude):
-    response = requests.get(f"https://api.open-meteo.com/v1/forecast?latitude={latitude}&longitude={longitude}&current=temperature_2m,wind_speed_10m&hourly=temperature_2m,relative_humidity_2m,wind_speed_10m")
-    data = response.json()
-    return data['current']['temperature_2m']
+    try:
+        response = requests.get(f"https://api.open-meteo.com/v1/forecast?latitude={latitude}&longitude={longitude}&current=temperature_2m,wind_speed_10m&hourly=temperature_2m,relative_humidity_2m,wind_speed_10m")
+        response.raise_for_status()  # Raise an exception for bad status codes
+        data = response.json()
+        
+        if 'current' not in data or 'temperature_2m' not in data['current']:
+            return "Weather data not available"
+            
+        return f"Current temperature: {data['current']['temperature_2m']}°C"
+    except requests.RequestException as e:
+        return f"Error fetching weather data: {str(e)}"
+    except (KeyError, ValueError) as e:
+        return f"Error processing weather data: {str(e)}"
 
 tools = [{
     "type": "function",
