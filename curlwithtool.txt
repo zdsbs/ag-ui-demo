@@ -1,0 +1,29 @@
+% curl -X POST http://localhost:8000/awp \
+  -H "Content-Type: application/json" \
+  -d '{
+    "thread_id": "test-thread-123",
+    "run_id": "test-run-456",
+    "state": {},
+    "messages": [
+      {
+        "role": "user",
+        "content": "What was a positive news story from today?",
+        "id": "user-789"
+      }
+    ],
+    "tools": [
+      {
+        "name": "web_search_preview",
+        "description": "Searches the web for current events",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {"type": "string"}
+          },
+          "required": ["query"]
+        }
+      }
+    ],
+    "context": [],
+    "forwardedProps": {}
+  }'
