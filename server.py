@@ -7,7 +7,6 @@ from ag_ui.core import (
   EventType,
   RunStartedEvent,
   RunFinishedEvent,
-  CustomEvent,
   TextMessageStartEvent,
   TextMessageContentEvent,
   TextMessageEndEvent,
@@ -232,9 +231,20 @@ async def my_endpoint(input_data: RunAgentInput):
             )         
             #TODO dynamically call the tool
             args = json.loads(tool_call_obj.arguments)
-
+            yield encoder.encode(
+                ToolCallArgsEvent(
+                    type=EventType.TOOL_CALL_ARGS,
+                    tool_call_id=tool_call_obj.id,
+                    delta=tool_call_obj.arguments
+                )
+            )
             result = get_weather(args["latitude"], args["longitude"])
-
+            yield encoder.encode(
+                ToolCallEndEvent(
+                    type=EventType.TOOL_CALL_END,
+                    tool_call_id=tool_call_obj.id
+                )
+            )
             input_messages.append({                               # append result message
                 "type": "function_call_output",
                 "call_id": tool_call_obj.call_id,
@@ -271,14 +281,6 @@ async def my_endpoint(input_data: RunAgentInput):
                     )
                     print()
 
-
-        # Send text message end event
-        yield encoder.encode(
-            TextMessageEndEvent(
-                type=EventType.TEXT_MESSAGE_END,
-                message_id=message_id
-            )
-        )
 
         # Send run finished event
         yield encoder.encode(
