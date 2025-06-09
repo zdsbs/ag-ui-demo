@@ -70,25 +70,109 @@ tools = [{
     "strict": True
 }]
 
+def text_message_start(encoder, message_id, role="assistant"):
+    yield encoder.encode(
+        TextMessageStartEvent(
+            type=EventType.TEXT_MESSAGE_START,
+            message_id=message_id,
+            role=role
+        )
+    )
+
+def run_started(encoder, thread_id, run_id):
+    yield encoder.encode(
+        RunStartedEvent(
+            type=EventType.RUN_STARTED,
+            thread_id=thread_id,
+            run_id=run_id
+        )
+    )
+
+def custom_event_agent_name(encoder, agent_name):
+    yield encoder.encode(
+        CustomEvent(
+            type=EventType.CUSTOM,
+            name="agent_name",
+            value=agent_name
+        )
+    )
+
+def text_message_content(encoder, message_id, delta):
+    yield encoder.encode(
+        TextMessageContentEvent(
+            type=EventType.TEXT_MESSAGE_CONTENT,
+            message_id=message_id,
+            delta=delta
+        )
+    )
+
+def text_message_end(encoder, message_id):
+    yield encoder.encode(
+        TextMessageEndEvent(
+            type=EventType.TEXT_MESSAGE_END,
+            message_id=message_id
+        )
+    )
+
+def tool_call_args(encoder, tool_call_id, delta):
+    yield encoder.encode(
+        ToolCallArgsEvent(
+            type=EventType.TOOL_CALL_ARGS,
+            tool_call_id=tool_call_id,
+            delta=delta
+        )
+    )
+
+def tool_call_start(encoder, tool_call_id, tool_call_name, parent_message_id):
+    yield encoder.encode(
+        ToolCallStartEvent(
+            type=EventType.TOOL_CALL_START,
+            tool_call_id=tool_call_id,
+            tool_call_name=tool_call_name,
+            parent_message_id=parent_message_id
+        )
+    )
+
+def tool_call_end(encoder, tool_call_id):
+    yield encoder.encode(
+        ToolCallEndEvent(
+            type=EventType.TOOL_CALL_END,
+            tool_call_id=tool_call_id
+        )
+    )
+
+def run_finished(encoder, thread_id, run_id):
+    yield encoder.encode(
+        RunFinishedEvent(
+            type=EventType.RUN_FINISHED,
+            thread_id=thread_id,
+            run_id=run_id
+        )
+    )
+
+def stream_final_response(encoder, client, input_messages, message_id):
+    final_stream = client.responses.create(
+        model="gpt-4.1",
+        input=input_messages,
+        stream=True
+    )
+    complete_response = ""
+    for event in final_stream:
+        if event.type == 'response.output_text.delta':
+            print(event.delta, end='', flush=True)
+            complete_response += event.delta
+            yield from text_message_content(encoder, message_id, event.delta)
+        elif event.type == 'response.completed':
+            yield from text_message_end(encoder, message_id)
+            print(f"\n--- Final Response ---\n{complete_response}\n----------------------")
+
 def event_generator(input_data, agent_name):
     # Create an event encoder to properly format SSE events
     encoder = EventEncoder()
     if agent_name:
-        yield encoder.encode(
-            CustomEvent(
-                type=EventType.CUSTOM,
-                name="agent_name",
-                value=agent_name
-            )
-        )
+        yield from custom_event_agent_name(encoder, agent_name)
     # Send run started event
-    yield encoder.encode(
-        RunStartedEvent(
-            type=EventType.RUN_STARTED,
-            thread_id=input_data.thread_id,
-            run_id=input_data.run_id
-        )
-    )
+    yield from run_started(encoder, input_data.thread_id, input_data.run_id)
 
     # Initialize OpenAI client
     client = OpenAI()
@@ -97,13 +181,7 @@ def event_generator(input_data, agent_name):
     message_id = str(uuid.uuid4())
 
     # Send text message start event
-    yield encoder.encode(
-        TextMessageStartEvent(
-            type=EventType.TEXT_MESSAGE_START,
-            message_id=message_id,
-            role="assistant"
-        )
-    )
+    yield from text_message_start(encoder, message_id, "assistant")
     # Create a streaming completion request
     input_messages = [{"role": "user", "content": input_data.messages[0].content}]
 
@@ -118,120 +196,38 @@ def event_generator(input_data, agent_name):
 
     for event in stream:
         #if the event is a function call, add it to the tool_call dictionary
-        initial_response = ""
-        if event.type == 'response.created':
-            print("created")
-            yield encoder.encode(
-                TextMessageStartEvent(
-                    type=EventType.TEXT_MESSAGE_START,
-                    message_id=message_id,
-                    role="assistant"
-                )
-            )
         if event.type == 'response.output_text.delta':
             print(event.delta, end='', flush=True)
-            initial_response += event.delta
-            yield encoder.encode(
-                TextMessageContentEvent(
-                    type=EventType.TEXT_MESSAGE_CONTENT,
-                    message_id=message_id,
-                    delta=event.delta
-                )
-            )
-        if event.type == 'response.completed':
+            yield from text_message_content(encoder, message_id, event.delta)
+        elif event.type == 'response.completed':
             print()
-            yield encoder.encode(
-                TextMessageEndEvent(
-                    type=EventType.TEXT_MESSAGE_END,
-                    message_id=message_id
-                )
-            )
-        if event.type == 'response.output_item.added' and event.item.type == "function_call":
-            tool_call[event.output_index] = event.item;
+            yield from text_message_end(encoder, message_id)
+        elif event.type == 'response.output_item.added' and event.item.type == "function_call":
+            tool_call[event.output_index] = event.item
         elif event.type == 'response.function_call_arguments.delta':
             index = event.output_index
             if tool_call[index]:
                 tool_call[index].arguments += event.delta
                 #encode the event
-                yield encoder.encode(
-                    ToolCallArgsEvent(
-                        type=EventType.TOOL_CALL_ARGS,
-                        tool_call_id=event.item_id,
-                        delta=event.delta
-                    )
-                )
+                yield from tool_call_args(encoder, event.item_id, event.delta)
     
     if tool_call:
         tool_call_obj = next(iter(tool_call.values()))
-        input_messages.append(tool_call_obj)  # append model's function call message
-        yield encoder.encode(
-            ToolCallStartEvent(
-                type=EventType.TOOL_CALL_START,
-                tool_call_id=tool_call_obj.id,
-                tool_call_name=tool_call_obj.name,
-                parent_message_id=message_id
-            )
-        )         
-        #TODO dynamically call the tool
         args = json.loads(tool_call_obj.arguments)
-        yield encoder.encode(
-            ToolCallArgsEvent(
-                type=EventType.TOOL_CALL_ARGS,
-                tool_call_id=tool_call_obj.id,
-                delta=tool_call_obj.arguments
-            )
-        )
+        input_messages.append(tool_call_obj)  # append model's function call message
+        yield from tool_call_start(encoder, tool_call_obj.id, tool_call_obj.name, message_id)
+        yield from tool_call_args(encoder, tool_call_obj.id, tool_call_obj.arguments)
         result = get_weather(args["latitude"], args["longitude"])
-        yield encoder.encode(
-            ToolCallEndEvent(
-                type=EventType.TOOL_CALL_END,
-                tool_call_id=tool_call_obj.id
-            )
-        )
         input_messages.append({                               # append result message
             "type": "function_call_output",
             "call_id": tool_call_obj.call_id,
             "output": str(result)
         })
-        final_stream = client.responses.create(
-            model="gpt-4.1",
-            input=input_messages,
-            tools=tools,
-            stream=True
-        )
-        # Initialize an empty string to build up the response
-        complete_response = ""
-
-        for event in final_stream:
-            if event.type == 'response.output_text.delta':
-                # Print each delta as it comes in
-                print(event.delta, end='', flush=True)
-                complete_response += event.delta
-                yield encoder.encode(
-                    TextMessageContentEvent(
-                        type=EventType.TEXT_MESSAGE_CONTENT,
-                        message_id=message_id,
-                        delta=event.delta
-                    )
-                )
-            elif event.type == 'response.completed':
-                # Print a newline at the end
-                yield encoder.encode(
-                    TextMessageEndEvent(
-                        type=EventType.TEXT_MESSAGE_END,
-                        message_id=message_id
-                    )
-                )
-                print()
+        yield from tool_call_end(encoder, tool_call_obj.id)
+        yield from stream_final_response(encoder, client, input_messages, message_id)
 
     # Send run finished event
-    yield encoder.encode(
-        RunFinishedEvent(
-            type=EventType.RUN_FINISHED,
-            thread_id=input_data.thread_id,
-            run_id=input_data.run_id
-        )
-    )
+    yield from run_finished(encoder, input_data.thread_id, input_data.run_id)
 
 @app.post("/awp")
 async def my_endpoint(input_data: RunAgentInput):
