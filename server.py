@@ -161,17 +161,16 @@ def send_ui_run_finished(encoder, thread_id, run_id):
     )
 
 class EventHandler:
-    def __init__(self, encoder: EventEncoder, client: OpenAI, input_messages: list, message_id: str):
+    def __init__(self, encoder: EventEncoder, message_id: str):
         self.encoder = encoder
-        self.client = client
-        self.input_messages = input_messages
         self.message_id = message_id
         self.tool_calls = {}
-        self.is_handling_final_stream = False
-        self.complete_response = ""
+        self.streamed_response = ""
 
     def handle_stream(self, stream):
-        """Processes the entire stream of events, yielding encoded SSE events."""
+        """Processes an entire stream of events, yielding encoded SSE events."""
+        self.tool_calls = {}
+        self.streamed_response = ""
         for event in stream:
             generated_events = self.process_event(event)
             if generated_events:
@@ -186,19 +185,13 @@ class EventHandler:
     def _(self, event: ResponseTextDeltaEvent):
         """Handles text delta events and yields a TextMessageContentEvent."""
         print(event.delta, end='', flush=True)
-        if self.is_handling_final_stream:
-            self.complete_response += event.delta
+        self.streamed_response += event.delta
         return send_ui_text_message_content(self.encoder, self.message_id, event.delta)
 
     @process_event.register
     def _(self, event: ResponseCompletedEvent):
         """Handles the completion of a text message and yields a TextMessageEndEvent."""
-        print()
-        if self.is_handling_final_stream:
-            print(f"--- Final Response ---\n{self.complete_response}\n----------------------")
-            # Reset state for potential future use
-            self.is_handling_final_stream = False
-            self.complete_response = ""
+        print(f"\n--- Streamed Message ---\n{self.streamed_response}\n----------------------")
         return send_ui_text_message_end(self.encoder, self.message_id)
 
     @process_event.register
@@ -215,10 +208,10 @@ class EventHandler:
             self.tool_calls[index].arguments += event.delta
             return send_ui_tool_call_args(self.encoder, event.item_id, event.delta)
 
-    def finalize_tool_calls(self):
+    def prepare_next_turn(self, input_messages: list):
         """
         If any tool calls were received, this method executes them, appends the results
-        to the message history, and streams the final response from the model.
+        to the message history, and yields the appropriate UI events.
         """
         if not self.tool_calls:
             return
@@ -229,7 +222,7 @@ class EventHandler:
         yield from send_ui_tool_call_start(self.encoder, tool_call_obj.id, tool_call_obj.name, self.message_id)
         yield from send_ui_tool_call_args(self.encoder, tool_call_obj.id, tool_call_obj.arguments)
 
-        self.input_messages.append(tool_call_obj)
+        input_messages.append(tool_call_obj)
 
         try:
             args = json.loads(tool_call_obj.arguments)
@@ -237,22 +230,13 @@ class EventHandler:
         except (json.JSONDecodeError, KeyError) as e:
             result = f"Error processing tool arguments: {e}"
 
-        self.input_messages.append({
+        input_messages.append({
             "type": "function_call_output",
             "call_id": tool_call_obj.call_id,
             "output": str(result)
         })
         
         yield from send_ui_tool_call_end(self.encoder, tool_call_obj.id)
-        
-        # Get the final response from the model by creating a new stream and handling it.
-        self.is_handling_final_stream = True
-        final_stream = self.client.responses.create(
-            model="gpt-4.1",
-            input=self.input_messages,
-            stream=True
-        )
-        yield from self.handle_stream(final_stream)
 
 
 def event_generator(input_data, agent_name):
@@ -269,21 +253,30 @@ def event_generator(input_data, agent_name):
     # Generate a message ID for the assistant's response
     message_id = str(uuid.uuid4())
 
-    # Send text message start event
+    # Send text message start event for the entire interaction
     yield from send_ui_text_message_start(encoder, message_id, "assistant")
-    # Create a streaming completion request
+    
     input_messages = [{"role": "user", "content": input_data.messages[0].content}]
+    handler = EventHandler(encoder, message_id)
+    active_tools = tools
 
-    stream = client.responses.create(
-        model=OPENAI_MODEL,
-        input=input_messages,
-        tools=tools,
-        stream=True
-    )
+    while True:
+        stream = client.responses.create(
+            model=OPENAI_MODEL,
+            input=input_messages,
+            tools=active_tools,
+            stream=True
+        )
 
-    handler = EventHandler(encoder, client, input_messages, message_id)
-    yield from handler.handle_stream(stream)
-    yield from handler.finalize_tool_calls()
+        yield from handler.handle_stream(stream)
+        
+        if handler.tool_calls:
+            yield from handler.prepare_next_turn(input_messages)
+            # We've used a tool, so the next turn should just be a text response.
+            active_tools = None 
+        else:
+            # No tool calls, so the agent is done.
+            break
 
     # Send run finished event
     yield from send_ui_run_finished(encoder, input_data.thread_id, input_data.run_id)
